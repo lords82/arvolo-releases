@@ -645,6 +645,11 @@ jobs:
             type=raw,value=latest,enable=${{ steps.lineage.outputs.on_main == 'true' }}
       - name: Build and push
         uses: docker/build-push-action@v6
+        # No build record as a run artifact: `publish` downloads every artifact
+        # of the run, and a .dockerbuild one cannot be extracted — when this job
+        # finished first, the release failed on a file it never wanted.
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: .
           file: relay/Dockerfile
