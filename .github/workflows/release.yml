@@ -1,0 +1,654 @@
+name: Release
+
+# The source lives in a private repository (lords82/arvolo); this one is public
+# and holds only the releases. A public repository's hosted runners are free,
+# so the builds run here: every job checks out the private source at the tag
+# with a read-only deploy key, and the release, its assets and the relay image
+# are published from here.
+#
+# Started by hand, once the tag is pushed to the source repository:
+#
+#   gh workflow run release.yml -R lords82/arvolo-releases -f tag=v0.16.0
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of lords82/arvolo to build and publish, e.g. v0.16.0"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    # Windows is a best-effort prebuilt (install.sh does not install there), so
+    # a Windows build failure must NOT block publishing the Linux/macOS release.
+    continue-on-error: ${{ matrix.label == 'windows-x86_64' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, label: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64 }
+          - { os: macos-latest, label: macos-universal }
+          - { os: windows-latest, label: windows-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lords82/arvolo
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        if: matrix.label != 'macos-universal'
+        run: |
+          cargo build --release --locked -p arvolo-cli -p arvolo-relay
+          echo "PKGDIR=target/release" >> "$GITHUB_ENV"
+        shell: bash
+      # macOS ships one archive for both kinds of Mac instead of one per chip.
+      # Built by compiling twice and joining the results with `lipo`, which is
+      # how a Mach-O binary carries two architectures in one file — the same
+      # mechanism macOS itself used through the PowerPC and Intel transitions.
+      #
+      # Cross-compiled from the arm64 runner rather than built on an Intel one.
+      # GitHub's Intel macOS runners are the last of their line, and a job that
+      # needs them is a job with an expiry date; this one has none.
+      - name: Build (macOS, both architectures)
+        if: matrix.label == 'macos-universal'
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin -p arvolo-cli -p arvolo-relay
+          cargo build --release --locked --target aarch64-apple-darwin -p arvolo-cli -p arvolo-relay
+          mkdir -p universal
+          for b in arvolo arvolo-relay; do
+            lipo -create -output "universal/$b" \
+              "target/x86_64-apple-darwin/release/$b" \
+              "target/aarch64-apple-darwin/release/$b"
+            lipo -info "universal/$b"
+          done
+          echo "PKGDIR=universal" >> "$GITHUB_ENV"
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: tar czf "arvolo-${{ inputs.tag }}-${{ matrix.label }}.tar.gz" -C "$PKGDIR" arvolo arvolo-relay
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path target/release/arvolo.exe, target/release/arvolo-relay.exe -DestinationPath "arvolo-${{ inputs.tag }}-${{ matrix.label }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          # Only `publish` reads these, minutes later; the files that last are the
+          # release assets. Left at the 90-day default they filled the storage
+          # quota (5.5 GB by v0.16.0-rc1) and every upload of that run failed.
+          retention-days: 3
+          name: ${{ matrix.label }}
+          path: arvolo-${{ inputs.tag }}-*
+
+  # The desktop app for Windows. Same three steps as the other two bundles: build
+  # the CLI, put it where the bundler expects a sidecar, bundle.
+  #
+  # Unsigned — the one bundle still shipped that way, now that the .dmg is
+  # signed in CI: SmartScreen shows "Windows protected your PC" and hides the
+  # Run button behind "More info". Signing needs a certificate from a CA, which
+  # unlike Apple's is bought per year from a third party.
+  app-windows:
+    name: desktop app (msi)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lords82/arvolo
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - name: Build the CLI to ship inside the app
+        shell: bash
+        run: |
+          cargo build --release --locked -p arvolo-cli
+          mkdir -p gui/src-tauri/binaries
+          cp target/release/arvolo.exe "gui/src-tauri/binaries/arvolo-$(rustc -vV | sed -n 's/^host: //p').exe"
+      - name: Install frontend deps
+        working-directory: gui
+        run: npm ci
+      # Windows Installer versions are four numbers, so "0.15.0-rc2" is not one:
+      # the bundler refuses a prerelease tag outright, and every rc shipped no
+      # .msi. A prerelease gets major.minor.patch.N, N being the digits of its
+      # suffix (rc2 → 2); a release keeps the version as it is.
+      - name: An MSI-shaped version for a prerelease
+        working-directory: gui
+        shell: bash
+        run: |
+          tag="${TAG#v}"
+          extra=""
+          case "$tag" in
+            *-*)
+              n=$(printf '%s' "${tag#*-}" | tr -cd '0-9')
+              printf '{"bundle":{"windows":{"wix":{"version":"%s.%s"}}}}' "${tag%%-*}" "${n:-0}" \
+                > src-tauri/msi-version.json
+              extra="--config src-tauri/msi-version.json"
+              ;;
+          esac
+          echo "MSI_EXTRA=$extra" >> "$GITHUB_ENV"
+      - name: Bundle
+        working-directory: gui
+        shell: bash
+        # The signing key is what makes the .msi installable *as an update*: the
+        # app refuses anything it cannot verify against the public key compiled
+        # into it. Unrelated to code signing — this one is ours, and the .msi is
+        # still unsigned as far as SmartScreen is concerned.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles msi --config src-tauri/tauri.release.conf.json $MSI_EXTRA
+      - name: Name it after the tag
+        shell: bash
+        run: |
+          out=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          src=$(ls "$out"/release/bundle/msi/*.msi | head -1)
+          cp "$src" "arvolo-${{ inputs.tag }}-windows-x86_64.msi"
+          # The detached signature travels beside the installer. It is not
+          # published for people to check by hand — `latest.json` quotes its
+          # contents — but naming it after the file it signs is what lets the
+          # manifest step find it without knowing how this job is built.
+          cp "$src.sig" "arvolo-${{ inputs.tag }}-windows-x86_64.msi.sig"
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: windows-msi
+          path: arvolo-${{ inputs.tag }}-*.msi*
+
+  # .deb and .rpm of the two command-line binaries.
+  #
+  # Built on the *oldest* runner still supported rather than the newest, and that
+  # is the whole trick: a Rust binary links only libc, so the one thing that
+  # decides where the package will install is the glibc of the machine that
+  # compiled it. Built on 24.04 it demands glibc 2.39 and refuses to install on
+  # Ubuntu 22.04 or Debian 12 — distributions people are still running. Built
+  # here, it works on those and on everything newer.
+  #
+  # (The .tar.gz in the `build` job above is still produced on ubuntu-latest and
+  # so carries the higher floor. Worth aligning one day; not silently, because
+  # someone may be relying on a newer glibc feature.)
+  linux-packages:
+    name: deb + rpm (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, arch: x86_64 }
+          - { os: ubuntu-22.04-arm, arch: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lords82/arvolo
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Built from source rather than downloaded. The prebuilt cargo-deb is itself
+      # linked against a newer glibc than this runner has — it refused to start
+      # with "GLIBC_2.39 not found" — which is precisely the problem this runner
+      # was chosen to avoid, arriving from the other direction. A few minutes of
+      # compilation buys a tool that runs where the packages are built.
+      - name: Packaging tools
+        run: cargo install --locked cargo-deb cargo-generate-rpm
+      - name: Build
+        run: cargo build --release --locked -p arvolo-cli -p arvolo-relay
+      # `--no-build` on both: the release binaries are already there, and letting
+      # each tool rebuild would double the work and risk two different binaries
+      # ending up in the two packages.
+      # A prerelease tag carries a hyphen, and both packaging worlds object — in
+      # opposite ways. RPM refuses the character outright ("invalid version
+      # 0.12.0-rc1"), and because both tools ran in one step that failure landed
+      # *after* the two .deb files were built and took them down with it: the
+      # first prerelease shipped no Linux packages at all. Debian, meanwhile,
+      # accepts the hyphen and reads the tail as a package revision, which sorts
+      # `0.12.0-rc1` **above** `0.12.0` — an rc apt would refuse to upgrade to the
+      # real thing.
+      #
+      # `~` is the one character both ecosystems define as sorting *before*, which
+      # is exactly what a release candidate is: 0.12.0~rc1 < 0.12.0. It is passed
+      # to each tool rather than written into the manifest, because Cargo parses
+      # that version as semver and rejects a tilde outright — rewriting it there
+      # breaks the build before either packager sees it. A final release has no
+      # hyphen, so the same line is a no-op for it.
+      - name: Package
+        run: |
+          PKGVER="$(printf '%s' "${TAG#v}" | tr '-' '~')"
+          echo "packaging as $PKGVER"
+          cargo deb --no-build -p arvolo-cli --deb-version "$PKGVER" \
+            --output "arvolo_${{ inputs.tag }}_${{ matrix.arch }}.deb"
+          cargo deb --no-build -p arvolo-relay --deb-version "$PKGVER" \
+            --output "arvolo-relay_${{ inputs.tag }}_${{ matrix.arch }}.deb"
+          cargo generate-rpm -p cli -s "version = \"$PKGVER\"" \
+            --output "arvolo-${{ inputs.tag }}-${{ matrix.arch }}.rpm"
+          cargo generate-rpm -p relay -s "version = \"$PKGVER\"" \
+            --output "arvolo-relay-${{ inputs.tag }}-${{ matrix.arch }}.rpm"
+      - name: What did we actually build
+        run: |
+          for f in *.deb; do echo "== $f"; dpkg-deb -I "$f" | sed -n 's/^ //p' | head -12; done
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: linux-packages-${{ matrix.arch }}
+          path: |
+            *.deb
+            *.rpm
+
+  # The desktop app as a .dmg, which is what someone who is not going to open a
+  # terminal can actually install. Separate from `build` because it is a different
+  # thing to build — node, the frontend, and the Tauri bundler — and because a
+  # failure here must not hold back the CLI tarballs that `install.sh` resolves.
+  app-macos:
+    name: desktop app (dmg)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lords82/arvolo
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      # The CLI goes *inside* the app. The GUI starts the daemon by looking for an
+      # `arvolo` binary next to its own executable and only then falls back to
+      # PATH, so an app shipped alone would work solely on machines that already
+      # have the CLI installed — which is precisely the audience a .dmg is for.
+      # Tauri's externalBin puts it there and strips the target triple.
+      #
+      # Built for both architectures, because the app is: one .dmg that runs on
+      # any Mac. All three names are written on purpose. Tauri picks a sidecar by
+      # the target triple of the build, and for a universal build the triple it
+      # asks for is not something to guess at from a machine that cannot run the
+      # installer — so both single-architecture names and the joined one are laid
+      # out, and whichever it reaches for is there. The unused ones are ignored.
+      - name: Build the CLI to ship inside the app
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin -p arvolo-cli
+          cargo build --release --locked --target aarch64-apple-darwin -p arvolo-cli
+          mkdir -p gui/src-tauri/binaries
+          cp target/x86_64-apple-darwin/release/arvolo gui/src-tauri/binaries/arvolo-x86_64-apple-darwin
+          cp target/aarch64-apple-darwin/release/arvolo gui/src-tauri/binaries/arvolo-aarch64-apple-darwin
+          lipo -create -output gui/src-tauri/binaries/arvolo-universal-apple-darwin \
+            gui/src-tauri/binaries/arvolo-x86_64-apple-darwin \
+            gui/src-tauri/binaries/arvolo-aarch64-apple-darwin
+          lipo -info gui/src-tauri/binaries/arvolo-universal-apple-darwin
+      - name: Install frontend deps
+        working-directory: gui
+        run: npm ci
+      - name: Bundle
+        working-directory: gui
+        # The sidecar is declared in a release-only config, merged over the base
+        # one. In the main config it would make `tauri dev` demand a built CLI
+        # before it would start, which is a tax on every day of work for the sake
+        # of a file that only matters when a release is cut.
+        #
+        # The same config names the Developer ID identity; these secrets are how
+        # the runner comes to hold it. APPLE_CERTIFICATE is the exported .p12,
+        # base64-encoded — the bundler imports it into a throwaway keychain that
+        # dies with the job. The APPLE_ID trio sends the signed app to Apple's
+        # notary and waits for the verdict. There is deliberately no unsigned
+        # fallback for a runner without the secrets: a release .dmg that only
+        # sometimes passes Gatekeeper is worse than a visibly failed job.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # A second key, unrelated to Apple's: this one signs the update payload
+          # so the running app can verify it against the public key compiled into
+          # it. Losing it does not break installed copies, it strands them —
+          # nothing signed with a different key will ever be accepted.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # `app` alongside `dmg`, because they are two different deliverables from
+        # one build: the .dmg is what a person downloads, and the .app.tar.gz the
+        # updater step below picks up is what an already-installed copy replaces
+        # itself with. Asking for the app target by name rather than relying on
+        # the .dmg to produce one as a side effect.
+        run: npm run tauri build -- --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.release.conf.json
+      # Asked for rather than assumed: `arvolo-gui` is a workspace member, so its
+      # artifacts land in the workspace's target directory and not in the crate's.
+      # Guessing the crate-local path found nothing, and the job failed *after* a
+      # successful build — the most expensive way to be wrong.
+      #
+      # Searched for rather than spelled out, because `--target` moves the bundle
+      # under a per-target directory: the path that was right yesterday is wrong
+      # today, and would fail at the last step of a job that had already done all
+      # the work. The check on the result is what makes the search honest.
+      - name: Name it after the tag
+        run: |
+          out=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          src=$(find "$out" -path '*/release/bundle/dmg/*.dmg' | head -1)
+          [ -n "$src" ] || { echo "no .dmg produced under $out"; exit 1; }
+          cp "$src" "arvolo-${{ inputs.tag }}-macos-universal.dmg"
+      # "Universal" is a claim about what is inside, so it gets checked before
+      # anyone downloads it: open the disk image and ask each of the two binaries
+      # which architectures it holds. A single-architecture app under a universal
+      # name is worse than no universal build at all — it fails on the machines
+      # the name promises, and only there.
+      - name: Both architectures, or it is not universal
+        run: |
+          hdiutil attach "arvolo-${{ inputs.tag }}-macos-universal.dmg" \
+            -nobrowse -readonly -mountpoint /tmp/dmg >/dev/null
+          status=0
+          for b in arvolo-gui arvolo; do
+            info=$(lipo -info "/tmp/dmg/Arvolo.app/Contents/MacOS/$b")
+            echo "$info"
+            case "$info" in
+              *x86_64*arm64* | *arm64*x86_64*) ;;
+              *) echo "::error::$b is not a universal binary"; status=1 ;;
+            esac
+          done
+          hdiutil detach /tmp/dmg >/dev/null
+          exit $status
+      # The app inside was notarized and stapled by the bundler; the disk image
+      # is a separate file with a separate verdict, so it goes to the notary too
+      # and carries its own stapled ticket. That is what lets Gatekeeper clear
+      # the download before it is even opened — and with no network at all.
+      - name: Notarize and staple the .dmg
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "arvolo-${{ inputs.tag }}-macos-universal.dmg" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "arvolo-${{ inputs.tag }}-macos-universal.dmg"
+      # What an installed copy downloads when it updates itself: the .app, as a
+      # tarball, plus its signature. The .app inside was signed, notarized and
+      # *stapled* by the bundler — which is why an update lands as a Gatekeeper-
+      # clean application even on a machine with no network left to ask.
+      #
+      # The .dmg is not usable here. It is a disk image a person mounts, and the
+      # updater replaces a bundle in place.
+      - name: The update payload
+        run: |
+          out=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          src=$(find "$out" -path '*/release/bundle/macos/*.app.tar.gz' | head -1)
+          [ -n "$src" ] || { echo "::error::no updater artifact under $out"; exit 1; }
+          [ -f "$src.sig" ] || { echo "::error::$src is not signed"; exit 1; }
+          name="arvolo-${{ inputs.tag }}-macos-universal.app.tar.gz"
+          cp "$src" "$name"
+          cp "$src.sig" "$name.sig"
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: macos-dmg
+          path: |
+            arvolo-${{ inputs.tag }}-*.dmg
+            arvolo-${{ inputs.tag }}-*.app.tar.gz*
+
+  # The desktop app for Linux, as an AppImage and nothing else.
+  #
+  # Not a .deb of the GUI, and the reason is not laziness. The app links
+  # WebKitGTK, which ships in two incompatible lines: 4.0 (libsoup2) and 4.1
+  # (libsoup3). Tauri 2 needs 4.1. A .deb would declare a dependency on
+  # `libwebkit2gtk-4.1-0`, a package that does not exist at all on Ubuntu 22.04
+  # or Debian 12 — so apt there does not warn, it refuses. One .deb per
+  # distribution release would be the alternative, each with its own lifetime.
+  # An AppImage carries its libraries with it and asks the system for nothing.
+  #
+  # What it does not escape is glibc: the floor is the builder's, so this runs on
+  # 24.04-era distributions and newer. That is the same audience anyway, since
+  # older ones cannot supply webkit2gtk-4.1 in the first place.
+  app-linux:
+    name: desktop app (AppImage)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lords82/arvolo
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - name: Desktop toolkit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev \
+            build-essential file fuse3
+      # Same reason as the .dmg: the app starts its daemon by looking for an
+      # `arvolo` binary beside its own executable.
+      - name: Build the CLI to ship inside the app
+        run: |
+          cargo build --release --locked -p arvolo-cli
+          mkdir -p gui/src-tauri/binaries
+          cp target/release/arvolo "gui/src-tauri/binaries/arvolo-$(rustc -vV | sed -n 's/^host: //p')"
+      - name: Install frontend deps
+        working-directory: gui
+        run: npm ci
+      - name: Bundle
+        working-directory: gui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles appimage --config src-tauri/tauri.release.conf.json
+      - name: Name it after the tag
+        run: |
+          out=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          src=$(ls "$out"/release/bundle/appimage/*.AppImage | head -1)
+          cp "$src" "arvolo-${{ inputs.tag }}-linux-x86_64.AppImage"
+          # Unlike macOS there is no separate payload: an AppImage *is* the
+          # application in one file, so the download and the update are the same
+          # artifact and only the signature is added.
+          cp "$src.sig" "arvolo-${{ inputs.tag }}-linux-x86_64.AppImage.sig"
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: 3
+          name: linux-appimage
+          path: arvolo-${{ inputs.tag }}-*.AppImage*
+
+  release:
+    name: publish
+    needs: [build, app-macos, app-linux, app-windows, linux-packages]
+    runs-on: ubuntu-latest
+    steps:
+      # The full history, and BEFORE download-artifact: checkout cleans the
+      # workspace, and the lineage check below needs main to compare against.
+      - uses: actions/checkout@v4
+        with:
+          repository: lords82/arvolo
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      # This repository too, for the text that closes every release's notes.
+      - uses: actions/checkout@v4
+        with:
+          path: .release
+      # A tag cut from a work branch produces a release for trying things out,
+      # not the one `install.sh` should resolve: mark it Pre-release and leave
+      # "latest" pointing at the last release whose commit main actually
+      # contains. Nothing to remember at tag time — lineage decides.
+      - name: Is this tag on main?
+        id: lineage
+        run: |
+          sha=$(git rev-parse "${TAG}^{commit}")
+          if git merge-base --is-ancestor "$sha" origin/main; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # The document every installed copy of the app reads to find out whether
+      # there is anything newer, and where it is. Written here rather than in the
+      # three bundle jobs because it is the one file that has to know about all
+      # of them at once.
+      #
+      # Each entry quotes the *contents* of a `.sig` — the signature travels
+      # inside the manifest, not beside the download, which is what lets the app
+      # verify a payload before it has finished trusting where it came from.
+      #
+      # Platforms whose signature did not arrive are left out rather than failing
+      # the step. The three app jobs are `continue-on-error` on purpose, and a
+      # Windows bundle that broke — which this workflow already tolerates — must
+      # not also take down the update path for macOS and Linux.
+      - name: The update manifest
+        run: |
+          tag="${TAG}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          platforms='{}'
+          add() {
+            local asset="$2"
+            if [ ! -f "dist/$asset.sig" ]; then
+              echo "::warning::no signature for $asset — $1 will not be offered an update"
+              return
+            fi
+            for key in $1; do
+              platforms=$(jq --arg k "$key" \
+                             --arg s "$(cat "dist/$asset.sig")" \
+                             --arg u "$base/$asset" \
+                             '.[$k] = {signature: $s, url: $u}' <<<"$platforms")
+            done
+          }
+          # One universal .app answers for both kinds of Mac: same file, same
+          # signature, two keys — the updater asks by target triple and does not
+          # know that the two are the same download.
+          add "darwin-x86_64 darwin-aarch64" "arvolo-${tag}-macos-universal.app.tar.gz"
+          add "linux-x86_64" "arvolo-${tag}-linux-x86_64.AppImage"
+          add "windows-x86_64" "arvolo-${tag}-windows-x86_64.msi"
+          if [ "$platforms" = '{}' ]; then
+            echo "::error::no signed bundles at all — this release cannot be updated to"
+            exit 1
+          fi
+          jq -n --arg v "${tag#v}" \
+                --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --argjson p "$platforms" \
+                '{version: $v, pub_date: $d, platforms: $p}' > dist/latest.json
+          cat dist/latest.json
+          # The compatibility table travels with the manifest: the app reads both
+          # from the same release, so the answer to "what is newest" and the
+          # answer to "what can my relay carry" can never come from two different
+          # points in time. Copied verbatim — it is maintained by hand, and this
+          # step is not the place to be clever about it.
+          jq . compat.json > dist/compat.json
+      # Checksums so `install.sh` can verify downloads.
+      - name: Checksums
+        run: (cd dist && sha256sum arvolo* > SHA256SUMS)
+      # The installer travels with each release, so that
+      # releases/latest/download/install.sh is always the one that knows how the
+      # latest release is laid out — the source repository it lives in is private.
+      - name: The installer
+        run: cp install.sh dist/install.sh
+      # The notes are the tag's own section of the changelog. GitHub's generated
+      # notes would list this repository's commits, which are about the workflow
+      # and say nothing about the release.
+      - name: Release notes
+        run: |
+          awk -v h="## ${TAG} " '
+            index($0, h) == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "::warning::no section for ${TAG} in CHANGELOG.md"
+          cat .release/release-notes-footer.md >> notes.md
+      # Published directly (non-draft); marked latest only from main, so
+      # `install.sh`'s `releases/latest` lookup never lands on a work-branch cut.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          # The tag is created here, on this repository's own commit: the
+          # source's commit does not exist in it.
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          body_path: notes.md
+          draft: false
+          prerelease: ${{ steps.lineage.outputs.prerelease }}
+          make_latest: ${{ steps.lineage.outputs.prerelease == 'false' }}
+
+  docker:
+    name: relay image (ghcr)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: lords82/arvolo
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      # Same lineage rule as `publish`: the server pulls `:latest`, so an image
+      # built from a work-branch tag must not claim it — it keeps only its
+      # version tag until the commit reaches main.
+      - name: Is this tag on main?
+        id: lineage
+        run: |
+          sha=$(git rev-parse "${TAG}^{commit}")
+          if git merge-base --is-ancestor "$sha" origin/main; then
+            echo "on_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "on_main=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/arvolo-relay
+          # v0.1.0 -> tags 0.1.0 and latest — latest only from main
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=raw,value=latest,enable=${{ steps.lineage.outputs.on_main == 'true' }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: relay/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
